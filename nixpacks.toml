@@ -1,9 +1,14 @@
-# Явно указываем Railpack/Nixpacks: это Python-проект
+# Fallback config if Railway/Nixpacks is selected manually.
+# Never call plain `pip` binary; always use python module invocation.
 [phases.setup]
-nixPkgs = ["python311"]
+nixPkgs = ["python311", "python311Packages.pip"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "python3 -m ensurepip --upgrade || true",
+  "python3 -m pip install --upgrade pip",
+  "python3 -m pip install -r requirements.txt"
+]
 
 [start]
 cmd = "python site/backend/app.py"

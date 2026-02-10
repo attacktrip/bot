@@ -4,6 +4,7 @@ import sqlite3
 import threading
 import secrets
 import time
+import uuid
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
@@ -19,9 +20,103 @@ from bot import functions as func
 from bot.config import db, admin, admin2, nicknameadm, chat_bota, instruction, procent, number_qiwi, replenish, BOT_USERNAME
 
 app = Flask(__name__)
+
+
+def init_auth_tables():
+    """Инициализация таблиц для deep-link авторизации"""
+    with sqlite3.connect(db) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_requests (
+                token TEXT PRIMARY KEY,
+                webapp_user_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                consumed INTEGER DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                session_token TEXT PRIMARY KEY,
+                telegram_user_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+        """)
+        conn.commit()
+
+
+def create_auth_request_token(webapp_user_id: int, ttl_seconds: int = 900) -> str:
+    token = secrets.token_urlsafe(24)
+    now = int(time.time())
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            'INSERT INTO auth_requests (token, webapp_user_id, created_at, expires_at, consumed) VALUES (?, ?, ?, ?, 0)',
+            (token, int(webapp_user_id), now, now + ttl_seconds),
+        )
+        conn.commit()
+    return token
+
+
+def get_site_url() -> str:
+    """Нормализованный базовый URL сайта из env (без завершающего /)."""
+    return os.environ.get('SITE_URL', 'http://localhost:5000').rstrip('/')
+
+
+def get_auth_request(token: str):
+    with sqlite3.connect(db) as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT token, webapp_user_id, created_at, expires_at, consumed FROM auth_requests WHERE token=?', (token,))
+        return cur.fetchone()
+
+
+def consume_auth_request(token: str):
+    with sqlite3.connect(db) as conn:
+        cur = conn.cursor()
+        cur.execute('UPDATE auth_requests SET consumed=1 WHERE token=? AND consumed=0', (token,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def create_session_token(telegram_user_id: int, ttl_seconds: int = 604800) -> str:
+    session_token = uuid.uuid4().hex + uuid.uuid4().hex
+    now = int(time.time())
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            'INSERT INTO auth_sessions (session_token, telegram_user_id, created_at, expires_at) VALUES (?, ?, ?, ?)',
+            (session_token, int(telegram_user_id), now, now + ttl_seconds),
+        )
+        conn.commit()
+    return session_token
+
+
+def get_session_user_id(session_token: str):
+    if not session_token:
+        return None
+    with sqlite3.connect(db) as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT telegram_user_id, expires_at FROM auth_sessions WHERE session_token=?', (session_token,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    user_id, expires_at = row
+    if int(time.time()) > int(expires_at):
+        with sqlite3.connect(db) as conn:
+            conn.execute('DELETE FROM auth_sessions WHERE session_token=?', (session_token,))
+            conn.commit()
+        return None
+    return int(user_id)
+
+init_auth_tables()
+
 @app.route("/")
 def landing():
     return send_from_directory(FRONTEND_DIR, "index.html")
+
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    """Проверка доступности сервиса для Railway healthcheck."""
+    return jsonify({'ok': True, 'service': 'bot-webapp'})
 
 
 @app.route("/app")
@@ -38,7 +133,7 @@ CORS(app, resources={
     r"/api/*": {
         "origins": "*",  # В продакшене укажите конкретные домены
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "X-Telegram-Init-Data"]
+        "allow_headers": ["Content-Type", "X-Telegram-Init-Data", "X-Web-Session"]
     }
 })
 
@@ -68,13 +163,20 @@ def get_telegram_user():
         return None
 
 def get_user_id():
-    """Получает user_id из Telegram"""
+    """Получает user_id из Telegram или из web-session токена"""
     user = get_telegram_user()
     if user:
         user_id = user.get('id')
         if user_id:
             return int(user_id)
-    return None
+
+    session_token = request.headers.get('X-Web-Session') or request.args.get('session_token')
+    if not session_token and request.is_json:
+        data = request.get_json(silent=True)
+        if data:
+            session_token = data.get('session_token')
+
+    return get_session_user_id(session_token)
 
 @app.route('/api/profile', methods=['GET'])
 def api_profile():
@@ -706,70 +808,108 @@ def api_about():
         'instruction': instruction
     })
 
-# Хранилище временных токенов для авторизации
-auth_tokens = {}
-
+# Авторизация через deep link + web session
 @app.route('/api/auth_link', methods=['POST'])
 def api_auth_link():
-    """Генерация уникальной авторизационной ссылки"""
+    """Генерация уникальной deep-link ссылки в бота"""
     try:
-        data = request.json
+        data = request.json or {}
         user_id = data.get('user_id')
-        
+
         if not user_id:
             return jsonify({'error': 'user_id требуется'}), 400
-        
-        # Генерируем уникальный токен
-        token = secrets.token_urlsafe(16)
-        
-        # Сохраняем токен с временной меткой (15 минут)
-        auth_tokens[token] = {
-            'user_id': user_id,
-            'created_at': time.time(),
-            'expires_at': time.time() + 900  # 15 минут
-        }
-        
-        # Формируем deep link
-        bot_username = BOT_USERNAME or os.environ.get('BOT_USERNAME', 'your_bot_username')
+
+        token = create_auth_request_token(int(user_id))
+
+        bot_username = (BOT_USERNAME or os.environ.get('BOT_USERNAME', '')).strip().lstrip('@')
+        if not bot_username:
+            return jsonify({'error': 'BOT_USERNAME не задан в переменных окружения'}), 500
+
         deep_link = f"https://t.me/{bot_username}?start=auth_{token}"
-        
+
         return jsonify({
             'auth_link': deep_link,
-            'token': token
+            'token': token,
+            'expires_in': 900
         })
-        
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/verify_token/<token>', methods=['GET'])
 def api_verify_token(token):
-    """Проверка токена авторизации"""
+    """Проверка токена авторизации (для Telegram-бота)"""
     try:
-        if token not in auth_tokens:
+        token_data = get_auth_request(token)
+        if not token_data:
             return jsonify({'error': 'Токен не найден'}), 404
-        
-        token_data = auth_tokens[token]
-        
-        # Проверяем срок действия
-        if time.time() > token_data['expires_at']:
-            del auth_tokens[token]
+
+        _, webapp_user_id, _, expires_at, consumed = token_data
+        if consumed:
+            return jsonify({'error': 'Токен уже использован'}), 409
+
+        if int(time.time()) > int(expires_at):
             return jsonify({'error': 'Токен истек'}), 410
-        
+
         return jsonify({
-            'user_id': token_data['user_id'],
+            'user_id': int(webapp_user_id),
             'valid': True
         })
-        
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/complete_auth/<token>', methods=['POST'])
+def api_complete_auth(token):
+    """Финализирует авторизацию и создает web-session"""
+    try:
+        data = request.get_json(silent=True) or {}
+        telegram_user_id = data.get('telegram_user_id')
+        if not telegram_user_id:
+            return jsonify({'error': 'telegram_user_id требуется'}), 400
+
+        token_data = get_auth_request(token)
+        if not token_data:
+            return jsonify({'error': 'Токен не найден'}), 404
+
+        _, webapp_user_id, _, expires_at, consumed = token_data
+        if consumed:
+            return jsonify({'error': 'Токен уже использован'}), 409
+        if int(time.time()) > int(expires_at):
+            return jsonify({'error': 'Токен истек'}), 410
+
+        if int(webapp_user_id) != int(telegram_user_id):
+            return jsonify({'error': 'Токен принадлежит другому пользователю'}), 403
+
+        if not consume_auth_request(token):
+            return jsonify({'error': 'Не удалось подтвердить токен'}), 409
+
+        session_token = create_session_token(int(telegram_user_id))
+        site_url = get_site_url()
+
+        return jsonify({
+            'success': True,
+            'session_token': session_token,
+            'redirect_url': f"{site_url}/app?session_token={session_token}"
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/auth_status', methods=['GET'])
+def api_auth_status():
+    user_id = get_user_id()
+    if not user_id:
+        return jsonify({'authorized': False}), 401
+    return jsonify({'authorized': True, 'user_id': user_id})
+
 def cleanup_expired_tokens():
-    """Очистка истекших токенов"""
-    current_time = time.time()
-    expired_tokens = [token for token, data in auth_tokens.items() 
-                     if current_time > data['expires_at']]
-    for token in expired_tokens:
-        del auth_tokens[token]
+    """Очистка истекших авторизационных токенов и web-сессий"""
+    now = int(time.time())
+    with sqlite3.connect(db) as conn:
+        conn.execute('DELETE FROM auth_requests WHERE expires_at < ? OR consumed = 1', (now,))
+        conn.execute('DELETE FROM auth_sessions WHERE expires_at < ?', (now,))
+        conn.commit()
 
 def run_bot():
     from bot.config import TOKEN
@@ -810,6 +950,7 @@ def run_bot():
 
 
 if __name__ == '__main__':
+    init_auth_tables()
     threading.Thread(target=run_bot, daemon=True).start()
 
     port = int(os.environ.get("PORT", 5000))
