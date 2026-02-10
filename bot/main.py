@@ -747,41 +747,65 @@ def handle_auth_start(message, auth_param):
     """Обработка авторизации через deep link"""
     chat_id = message.chat.id
     username = message.from_user.username
-    
-    # Извлекаем токен из параметра
+
     token = auth_param.replace('auth_', '')
-    
+
     try:
-        # Проверяем токен через API
-        base_url = os.environ.get('SITE_URL', 'http://localhost:5000')
-        response = requests.get(f"{base_url}/api/verify_token/{token}", timeout=10)
-        
-        if response.status_code == 200:
-            token_data = response.json()
-            webapp_user_id = token_data['user_id']
-            
-            # Создаем/обновляем пользователя в бота
-            if username:
-                func.first_join(user_id=chat_id, username=username)
-            
-            # Отправляем сообщение с кнопкой для перехода на сайт
-            auth_markup = types.InlineKeyboardMarkup()
-            site_url = f"{base_url}/app?auth_user={chat_id}"
-            auth_button = types.InlineKeyboardButton(text="🔐 Перейти на сайт", url=site_url)
-            auth_markup.add(auth_button)
-            
-            bot.send_message(
-                chat_id,
-                "Нажмите кнопку ниже, чтобы авторизоваться",
-                reply_markup=auth_markup
-            )
-            
-        else:
+        base_url = os.environ.get('SITE_URL', 'http://localhost:5000').rstrip('/')
+
+        verify_response = requests.get(f"{base_url}/api/verify_token/{token}", timeout=10)
+        if verify_response.status_code != 200:
             bot.send_message(
                 chat_id,
                 "⛔️ Ссылка авторизации недействительна или истекла. Попробуйте получить новую ссылку на сайте."
             )
-            
+            return
+
+        token_data = verify_response.json()
+        token_user_id = int(token_data.get('user_id', 0))
+        if token_user_id != int(chat_id):
+            bot.send_message(
+                chat_id,
+                "⛔️ Эта ссылка создана для другого аккаунта Telegram. Откройте ссылку из правильного аккаунта."
+            )
+            return
+
+        if username:
+            func.first_join(user_id=chat_id, username=username)
+
+        complete_response = requests.post(
+            f"{base_url}/api/complete_auth/{token}",
+            json={'telegram_user_id': chat_id},
+            timeout=10
+        )
+
+        if complete_response.status_code != 200:
+            error_text = ''
+            try:
+                error_text = complete_response.json().get('error', '')
+            except Exception:
+                pass
+            bot.send_message(
+                chat_id,
+                f"⛔️ Не удалось завершить авторизацию. {error_text or 'Вернитесь на сайт и запросите ссылку заново.'}"
+            )
+            return
+
+        redirect_url = complete_response.json().get('redirect_url')
+        if not redirect_url:
+            bot.send_message(chat_id, "⛔️ Ошибка формирования ссылки авторизации.")
+            return
+
+        auth_markup = types.InlineKeyboardMarkup()
+        auth_button = types.InlineKeyboardButton(text="🔐 Авторизоваться на сайте", url=redirect_url)
+        auth_markup.add(auth_button)
+
+        bot.send_message(
+            chat_id,
+            "✅ Готово! Нажмите кнопку ниже — сайт откроется уже с авторизацией под вашим аккаунтом.",
+            reply_markup=auth_markup
+        )
+
     except Exception as e:
         print(f"Error handling auth: {e}")
         bot.send_message(
