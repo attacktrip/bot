@@ -44,6 +44,32 @@ const API_BASE = (typeof window !== 'undefined' && window.location && window.loc
 let currentUser = null;
 let currentDealRole = 'customer';
 let currentDealRoleSelector = 'seller';
+let webSessionToken = null;
+
+function getStoredSessionToken() {
+    if (webSessionToken) return webSessionToken;
+    try {
+        const token = localStorage.getItem('web_session_token');
+        if (token) {
+            webSessionToken = token;
+            return token;
+        }
+    } catch (e) {
+        console.warn('localStorage недоступен:', e);
+    }
+    return null;
+}
+
+function setStoredSessionToken(token) {
+    if (!token) return;
+    webSessionToken = token;
+    try {
+        localStorage.setItem('web_session_token', token);
+    } catch (e) {
+        console.warn('Не удалось сохранить токен сессии:', e);
+    }
+}
+
 
 // Вставляем иконки после загрузки страницы и при динамическом создании элементов
 function insertIcons() {
@@ -63,7 +89,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initTelegramUser();
     setupEventListeners();
     
-    // Проверяем параметр auth_user в URL (возврат с бота)
+    // Проверяем возврат с бота после deep-link авторизации
     checkAuthReturn();
     
     // Проверяем наличие username (обязательно для работы бота)
@@ -101,6 +127,7 @@ function initTelegramUser() {
 // Проверка и создание пользователя
 async function checkAndCreateUser() {
     const initData = getInitData();
+    const sessionToken = getStoredSessionToken();
     if (!initData) return;
     try {
         const url = `${API_BASE}/api/profile` + (initData ? '?init_data=' + encodeURIComponent(initData) : '');
@@ -199,6 +226,7 @@ function getInitData() {
 // API запросы
 async function apiRequest(endpoint, options = {}) {
     const initData = getInitData();
+    const sessionToken = getStoredSessionToken();
     const defaultOptions = {
         headers: {
             'Content-Type': 'application/json'
@@ -227,6 +255,14 @@ async function apiRequest(endpoint, options = {}) {
         if (!options.method || options.method === 'GET') {
             const sep = endpoint.indexOf('?') >= 0 ? '&' : '?';
             endpoint = endpoint + sep + 'init_data=' + encodeURIComponent(initData);
+        }
+    }
+
+    if (sessionToken) {
+        mergedOptions.headers['X-Web-Session'] = sessionToken;
+        if (!options.method || options.method === 'GET') {
+            const sep = endpoint.indexOf('?') >= 0 ? '&' : '?';
+            endpoint = endpoint + sep + 'session_token=' + encodeURIComponent(sessionToken);
         }
     }
 
@@ -929,7 +965,7 @@ function showAuthModal() {
             <p>Нажмите кнопку ниже, чтобы перейти к боту и получить ссылку для входа.</p>
             <div style="margin-top: 20px;">
                 <button class="glass-btn" onclick="generateAuthLink()" id="auth-link-btn">
-                    🔄 Генерация ссылки...
+                    🔐 Авторизоваться через бота
                 </button>
             </div>
         </div>
@@ -937,8 +973,6 @@ function showAuthModal() {
     
     showModal('Авторизация', modalHTML, '', true); // true = не закрывать автоматически
     
-    // Автоматически генерируем ссылку
-    generateAuthLink();
 }
 
 // Генерация авторизационной ссылки
@@ -947,7 +981,7 @@ async function generateAuthLink() {
     if (!btn) return;
     
     try {
-        btn.textContent = '🔄 Генерация ссылки...';
+        btn.textContent = '🔄 Подготовка ссылки...';
         btn.disabled = true;
         
         // Получаем user_id из Telegram WebApp
@@ -989,22 +1023,23 @@ function getTelegramUserFromWebApp() {
 // Проверка возврата с бота после авторизации
 function checkAuthReturn() {
     const urlParams = new URLSearchParams(window.location.search);
-    const authUser = urlParams.get('auth_user');
-    
-    if (authUser) {
-        // Показываем сообщение об успешной авторизации
+    const sessionToken = urlParams.get('session_token');
+
+    if (sessionToken) {
+        setStoredSessionToken(sessionToken);
+
         showModal('✅ Успешная авторизация', `
             <p>Вы успешно авторизованы! Теперь вы можете использовать все функции приложения.</p>
         `, `
             <button class="glass-btn" onclick="closeModal(); loadProfile();">OK</button>
         `);
-        
-        // Очищаем URL от параметров авторизации
-        window.history.replaceState({}, document.title, window.location.pathname);
-        
-        // Перезагружаем профиль, если пользователь уже определен
+
+        urlParams.delete('session_token');
+        const cleaned = window.location.pathname + (urlParams.toString() ? `?${urlParams.toString()}` : '');
+        window.history.replaceState({}, document.title, cleaned);
+
         if (currentUser) {
-            setTimeout(loadProfile, 1000);
+            setTimeout(loadProfile, 800);
         }
     }
 }
